@@ -31,6 +31,10 @@ on:
         description: Run a GitHub-hosted probe path to surface blockers without a self-hosted Mac builder
         type: boolean
         default: false
+      github_hosted_macos_attempt:
+        description: Try a real macOS GitHub-hosted Chromium checkout and BrowserOS pre-build path
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -49,6 +53,7 @@ jobs:
       upload_to_r2: ${{ steps.workflow_inputs.outputs.upload_to_r2 }}
       release_server: ${{ steps.workflow_inputs.outputs.release_server }}
       github_hosted_probe: ${{ steps.workflow_inputs.outputs.github_hosted_probe }}
+      github_hosted_macos_attempt: ${{ steps.workflow_inputs.outputs.github_hosted_macos_attempt }}
       server_version: ${{ steps.server_version.outputs.server_version }}
     steps:
       - name: Resolve workflow inputs
@@ -63,6 +68,7 @@ jobs:
           DISPATCH_UPLOAD_TO_R2: ${{ inputs.upload_to_r2 }}
           DISPATCH_RELEASE_SERVER: ${{ inputs.release_server }}
           DISPATCH_GITHUB_HOSTED_PROBE: ${{ inputs.github_hosted_probe }}
+          DISPATCH_GITHUB_HOSTED_MACOS_ATTEMPT: ${{ inputs.github_hosted_macos_attempt }}
           DISPATCH_REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -74,6 +80,7 @@ jobs:
             upload_to_r2="true"
             release_server="${NIGHTLY_RELEASE_SERVER:-auto}"
             github_hosted_probe="false"
+            github_hosted_macos_attempt="false"
           else
             target_ref="$DISPATCH_REF"
             bump_mode="${DISPATCH_BUMP:-offset+build}"
@@ -81,6 +88,7 @@ jobs:
             upload_to_r2="${DISPATCH_UPLOAD_TO_R2:-true}"
             release_server="${DISPATCH_RELEASE_SERVER:-true}"
             github_hosted_probe="${DISPATCH_GITHUB_HOSTED_PROBE:-false}"
+            github_hosted_macos_attempt="${DISPATCH_GITHUB_HOSTED_MACOS_ATTEMPT:-false}"
           fi
 
           if [ "$release_server" = "auto" ]; then
@@ -108,6 +116,7 @@ jobs:
             echo "upload_to_r2=$upload_to_r2"
             echo "release_server=$release_server"
             echo "github_hosted_probe=$github_hosted_probe"
+            echo "github_hosted_macos_attempt=$github_hosted_macos_attempt"
           } >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v6
@@ -128,7 +137,7 @@ jobs:
           PY
 
   authorize_manual_dispatch:
-    if: github.event_name == 'workflow_dispatch' && needs.resolve_inputs.outputs.github_hosted_probe != 'true'
+    if: github.event_name == 'workflow_dispatch' && needs.resolve_inputs.outputs.github_hosted_probe != 'true' && needs.resolve_inputs.outputs.github_hosted_macos_attempt != 'true'
     needs: resolve_inputs
     runs-on: [self-hosted, macOS, ARM64, browseros-builder]
     environment: release-core
@@ -141,6 +150,7 @@ jobs:
       always() &&
       needs.resolve_inputs.result == 'success' &&
       needs.resolve_inputs.outputs.github_hosted_probe != 'true' &&
+      needs.resolve_inputs.outputs.github_hosted_macos_attempt != 'true' &&
       needs.resolve_inputs.outputs.release_server == 'true' &&
       (github.event_name == 'schedule' || needs.authorize_manual_dispatch.result == 'success')
     permissions:
@@ -159,6 +169,7 @@ jobs:
       always() &&
       needs.resolve_inputs.result == 'success' &&
       needs.resolve_inputs.outputs.github_hosted_probe != 'true' &&
+      needs.resolve_inputs.outputs.github_hosted_macos_attempt != 'true' &&
       (github.event_name == 'schedule' || needs.authorize_manual_dispatch.result == 'success') &&
       (needs.resolve_inputs.outputs.release_server != 'true' || needs.release_server.result == 'success')
     runs-on: [self-hosted, macOS, ARM64, browseros-builder]
@@ -462,3 +473,58 @@ jobs:
             echo "::error::Probe reached BrowserOS build preflight on GitHub-hosted Actions. Full macOS packaging still requires a Chromium checkout path via CHROMIUM_SRC / BROWSEROS_CHROMIUM_SRC on a macOS builder."
             exit 1
           fi
+
+  macos_hosted_attempt:
+    needs: resolve_inputs
+    if: |
+      always() &&
+      needs.resolve_inputs.result == 'success' &&
+      needs.resolve_inputs.outputs.github_hosted_macos_attempt == 'true'
+    runs-on: macos-15
+    permissions:
+      contents: read
+    timeout-minutes: 120
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      DEPOT_TOOLS_UPDATE: 0
+      FETCH_HEADLESS: 1
+      PYTHONUNBUFFERED: 1
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.resolve_inputs.outputs.target_ref }}
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.6"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install depot_tools
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$RUNNER_TEMP/depot_tools"
+          echo "$RUNNER_TEMP/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Bootstrap Chromium checkout
+        env:
+          CHECKOUT_ROOT: ${{ runner.temp }}/chromium-release
+        run: |
+          set -euo pipefail
+          mkdir -p "$CHECKOUT_ROOT"
+          cd "$CHECKOUT_ROOT"
+          fetch --nohooks --no-history chromium
+          test -d "$CHECKOUT_ROOT/src"
+          echo "CHROMIUM_SRC=$CHECKOUT_ROOT/src" >> "$GITHUB_ENV"
+
+      - name: Run BrowserOS pre-build pipeline on hosted macOS
+        run: |
+          set -euo pipefail
+          cd packages/browseros
+          uv run browseros build \
+            --chromium-src "$CHROMIUM_SRC" \
+            --arch arm64 \
+            --build-type release \
+            --modules clean,git_setup,sparkle_setup,download_resources,resources,bundled_extensions,chromium_replace,string_replaces,series_patches,patches,configure
